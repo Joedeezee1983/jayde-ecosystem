@@ -125,13 +125,12 @@ describe("JayDeEscrow", function () {
       expect(trade.status).to.equal(2); // Status.REFUNDED
     });
 
-    it("owner can also refund an open trade", async function () {
+    // [SEC-C1] owner bypass removed — direct owner call would send tokens to the caller's
+    //           proxy address without updating any purchase.released flag, locking funds.
+    it("owner cannot directly refund an open trade — only the buyer (proxy) may call refundTrade", async function () {
       await escrow.connect(buyer).createTrade(seller.address, TRADE_AMOUNT);
-      const buyerBefore = await token.balanceOf(buyer.address);
-
-      await escrow.connect(owner).refundTrade(1);
-
-      expect(await token.balanceOf(buyer.address)).to.equal(buyerBefore + TRADE_AMOUNT);
+      await expect(escrow.connect(owner).refundTrade(1))
+        .to.be.revertedWith("Not buyer");
     });
 
     it("emits TradeRefunded event", async function () {
@@ -154,8 +153,9 @@ describe("JayDeEscrow", function () {
       await escrow.connect(buyer).createTrade(seller.address, TRADE_AMOUNT);
       await escrow.connect(buyer).refundTrade(1);
 
+      // [SEC-H2] error message updated: completeTrade now accepts OPEN or DISPUTED
       await expect(escrow.connect(buyer).completeTrade(1))
-        .to.be.revertedWith("Trade not open");
+        .to.be.revertedWith("Trade not open or disputed");
     });
   });
 
@@ -181,23 +181,34 @@ describe("JayDeEscrow", function () {
       expect(trade.status).to.equal(3); // Status.DISPUTED
     });
 
-    it("owner can refund buyer after dispute, buyer gets full amount back", async function () {
+    // [SEC-C1] owner bypass removed — buyer (proxy) must call refundTrade directly.
+    it("buyer can refund a disputed trade — owner cannot bypass refundTrade directly", async function () {
       await escrow.connect(buyer).createTrade(seller.address, TRADE_AMOUNT);
       await escrow.connect(seller).disputeTrade(1);
 
-      const buyerBefore = await token.balanceOf(buyer.address);
-      await escrow.connect(owner).refundTrade(1);
+      // Owner cannot shortcut
+      await expect(escrow.connect(owner).refundTrade(1))
+        .to.be.revertedWith("Not buyer");
 
+      // Buyer (the legitimate caller) can still refund a DISPUTED trade
+      const buyerBefore = await token.balanceOf(buyer.address);
+      await escrow.connect(buyer).refundTrade(1);
       expect(await token.balanceOf(buyer.address)).to.equal(buyerBefore + TRADE_AMOUNT);
       expect((await escrow.trades(1)).status).to.equal(2); // Status.REFUNDED
     });
 
-    it("cannot complete a disputed trade", async function () {
+    // [SEC-H2] completeTrade now accepts DISPUTED status so resolveDisputeForSeller works.
+    it("buyer can complete a disputed trade — enables seller-favoured dispute resolution", async function () {
       await escrow.connect(buyer).createTrade(seller.address, TRADE_AMOUNT);
       await escrow.connect(seller).disputeTrade(1);
 
-      await expect(escrow.connect(buyer).completeTrade(1))
-        .to.be.revertedWith("Trade not open");
+      const sellerBefore = await token.balanceOf(seller.address);
+      await escrow.connect(buyer).completeTrade(1);
+
+      const expectedFee    = (TRADE_AMOUNT * FEE_BPS) / BPS_DENOM;
+      const expectedPayout = TRADE_AMOUNT - expectedFee;
+      expect(await token.balanceOf(seller.address)).to.equal(sellerBefore + expectedPayout);
+      expect((await escrow.trades(1)).status).to.equal(1); // Status.COMPLETED
     });
 
     it("cannot dispute an already completed trade", async function () {
@@ -229,14 +240,15 @@ describe("JayDeEscrow", function () {
         .to.be.revertedWith("Not a party");
     });
 
-    it("non-buyer/non-owner cannot refund a trade", async function () {
+    // [SEC-C1] error message updated: only "Not buyer" now — owner bypass was removed
+    it("non-buyer cannot refund a trade — seller and stranger both revert", async function () {
       await escrow.connect(buyer).createTrade(seller.address, TRADE_AMOUNT);
 
       await expect(escrow.connect(seller).refundTrade(1))
-        .to.be.revertedWith("Not authorized");
+        .to.be.revertedWith("Not buyer");
 
       await expect(escrow.connect(stranger).refundTrade(1))
-        .to.be.revertedWith("Not authorized");
+        .to.be.revertedWith("Not buyer");
     });
 
     it("non-owner cannot change feeBps", async function () {
